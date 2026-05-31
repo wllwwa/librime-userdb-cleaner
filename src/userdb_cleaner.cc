@@ -30,7 +30,6 @@
 
 // Rime 头文件
 #include <rime/service.h>
-#include <rime/lever/deployment_tasks.h>  // 包含 UserDictSync
 
 namespace fs = std::filesystem;
 
@@ -918,7 +917,9 @@ static void show_message_utf8(const std::string& title, const std::string& messa
 #endif
 }
 
-/** Build the UTF-8 notification message string (shared by all platforms). */
+/**
+ * Build the UTF-8 notification message string (shared by all platforms).
+ */
 static std::string build_clean_message_utf8(
     int delete_item_count,
     const std::vector<std::string>& cleaned_folders,
@@ -1003,14 +1004,36 @@ void send_clean_msg(int delete_item_count,
 #endif
 }
 
-/** Execute Rime user dictionary sync using platform-appropriate method. */
-static void execute_sync() {
+/**
+ * 执行用户词典同步，并等待同步完成。
+ * 该函数封装了 Rime API 的同步功能，确保同步操作在当前线程中串行执行。
+ * Windows 平台下调用 WeaselDeployer.exe /sync，该进程同步执行。
+ * 其他平台使用 rime_get_api()->sync_user_data() 启动异步同步，然后调用
+ * join_maintenance_thread() 等待同步完成。
+ */
+static void execute_sync_and_wait() {
 #ifdef _WIN32
+    // Windows 平台：WeaselDeployer.exe 执行同步，进程等待直到完成
     execute_weasel_deployer("/sync");
 #else
-    Deployer& deployer = rime::Service::instance().deployer();
-    UserDictSync sync_task;
-    sync_task.Run(&deployer);
+    // 非 Windows 平台：使用 Rime API 进行同步
+    RimeApi* api = rime_get_api();
+    if (!api) {
+        LOG(ERROR) << "Rime API not available, cannot perform sync";
+        return;
+    }
+    // 检查 sync_user_data 函数是否可用
+    if (RIME_API_AVAILABLE(api, sync_user_data)) {
+        api->sync_user_data();
+        // 等待维护线程结束，确保同步完成
+        if (RIME_API_AVAILABLE(api, join_maintenance_thread)) {
+            api->join_maintenance_thread();
+        } else {
+            LOG(WARNING) << "join_maintenance_thread not available, sync may be incomplete";
+        }
+    } else {
+        LOG(ERROR) << "sync_user_data API not available";
+    }
 #endif
 }
 
@@ -1042,21 +1065,23 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
   // 获取同步目录和当前用户 ID
   fs::path sync_dir = get_sync_directory();
 
-  // 同步前：将 sync_dir 中当前用户的 .userdb.txt 重命名为 .userdb_backup.txt，
-  // 阻止 Synchronize 的 Restore(Merger) 步骤将旧数据覆盖回本地
-  {
+  // 同步前：备份并删除 sync_dir 中当前用户的 .userdb.txt 文件，
+  // 阻止 Synchronize 的 Restore(Merger) 步骤将所有词条的 tick 统一刷成总 tick
+  if (clean_mode == "tick" || clean_mode == "c_then_tick") {
+    // 从 Deployer 获取当前用户的 user_id
     std::string current_user_id = rime::Service::instance().deployer().user_id;
 
     if (!current_user_id.empty()) {
       clean_sync_user_files(sync_dir, current_user_id);
     } else {
-      LOG(WARNING) << "Could not determine current user_id, skipping sync cleanup";
+      LOG(WARNING) << "Could not determine current user_id, skipping sync cleanup"
+                    << " (this may cause ticks to be reset during sync)";
     }
   }
 
-  // Pre-clean sync
+  // 同步前等待，确保没有残留的同步任务在运行，并导出当前词典快照
   LOG(INFO) << "Executing pre-clean sync...";
-  execute_sync();
+  execute_sync_and_wait();
 
   std::unordered_set<std::string> cleanup_set(cleanup_list.begin(), cleanup_list.end());
   
@@ -1073,9 +1098,9 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
   // 记录删除的词条到日志文件
   log_deleted_words(deleted_words, sync_dir);
   
-  // Post-clean sync
+  // 同步后等待，将清理后的词典重新导出快照，并合并其他设备可能的上传
   LOG(INFO) << "Executing post-clean sync...";
-  execute_sync();
+  execute_sync_and_wait();
   
   LOG(INFO) << "Userdb cleaning completed. Total deleted entries: " << file_deleted_count;
   LOG(INFO) << "Cleaned folders: " << cleaned_folders.size();
